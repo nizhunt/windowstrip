@@ -57,6 +57,14 @@ final class Controller: NSObject, StripViewDelegate {
     private var neighbours: [Neighbour] = []
     private var lastRepair: UInt64 = 0
     private var repairs = 0
+    /// Times the panels were rebuilt to put them back on every desktop (state
+    /// file), and when a window list without one last made us check (at most
+    /// every 2 s).
+    private var desktopRepairs = 0
+    private var lastDesktopCheck: UInt64 = 0
+    private var lastDesktopRepair: UInt64 = 0
+    private var desktopRepairGap: UInt64 = 3_000_000_000
+    private var desktopRepairPending = false
 
     // Refreshing.
     private var scheduled = Set<UInt64>()
@@ -149,6 +157,7 @@ final class Controller: NSObject, StripViewDelegate {
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(self, selector: #selector(refreshRequested), name: Notification.Name("dev.windowstrip.refresh"), object: nil)
+        dnc.addObserver(self, selector: #selector(testDropEveryDesktop), name: Notification.Name("dev.windowstrip.test.dropEveryDesktop"), object: nil)
         if UserDefaults.standard.bool(forKey: "snapshots") {
             // Off by default: the tooltip picture can show a window title.
             dnc.addObserver(self, selector: #selector(snapshotRequested), name: Notification.Name("dev.windowstrip.snapshot"), object: nil)
@@ -417,6 +426,7 @@ final class Controller: NSObject, StripViewDelegate {
             self.noteSpaces(reply.positions)
             self.applyFullScreen(reply.fullScreen)
             Activity.run("refresh(\(reason))") { self.applyList(reason) }
+            self.checkShown(reply.windows)
             self.slides = [:]
             self.checkLateRaises(reply.windows)
             if let next = self.listPending {
@@ -643,9 +653,12 @@ final class Controller: NSObject, StripViewDelegate {
             if near.contains(where: \.closed) || near.isEmpty {
                 caps[display] = Notch.iconLimit(strip: strip, neighbours: near)
             }
-            // Stay under same-level neighbours; at most one repair every 2 s.
+            // Stay under same-level neighbours; at most one repair every 2 s,
+            // and none on a full-screen Space or while a Space change settles
+            // (ordering these panels then can leave them on one desktop).
             for (what, p) in [("strip", panel), ("cover", covers[display])] {
-                guard let p, now &- lastRepair > 2_000_000_000, p.isVisible else { continue }
+                guard let p, now &- lastRepair > 2_000_000_000, p.isVisible, !hiddenForFullScreen.contains(display),
+                      now &- spaceChangedAt > 1_000_000_000 else { continue }
                 let ours = CGWindowID(p.windowNumber)
                 if let ourIndex = all.firstIndex(where: { $0.id == ours }),
                    let island = near.first(where: { n in n.win.layer == p.level.rawValue
@@ -697,8 +710,13 @@ final class Controller: NSObject, StripViewDelegate {
                 let area = NSRect(x: screen.frame.maxX - right.width, y: frame.minY, width: right.width, height: height)
                 let cover = blackPanel(NSRect(x: area.minX, y: area.minY, width: 1, height: area.height))
                 cover.contentView = NSView()
+                // On screen from the start, transparent while off: ordered in
+                // and out on app switches it could end up on one desktop, like
+                // the strip (applyFullScreen).
+                setShown(cover, false)
                 covers[id] = cover
                 coverArea[id] = area
+                Log.info("cover", "display \(id): ready, transparent, \(orderIn(cover, display: id))")
             }
             if let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() {
                 displayUUID[id] = CFUUIDCreateString(nil, uuid) as String
@@ -719,7 +737,7 @@ final class Controller: NSObject, StripViewDelegate {
         panel.hidesOnDeactivate = false
         panel.isExcludedFromWindowsMenu = true
         // Without .fullScreenAuxiliary, but a panel at this level still
-        // shows on full-screen Spaces: `applyFullScreen` takes it off.
+        // shows on full-screen Spaces: `applyFullScreen` hides it.
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         return panel
     }
@@ -740,14 +758,18 @@ final class Controller: NSObject, StripViewDelegate {
 
     /// A full-screen app gets the whole screen: the strip leaves a display
     /// while it shows a full-screen app's Space, and comes back with the
-    /// desktop. Each window list says which displays those are.
+    /// desktop. Each window list says which displays those are. The strip
+    /// stays ordered in and only turns transparent and click-through: ordered
+    /// out there and back in as the Space ended, it stayed on one desktop
+    /// only (T27).
     private func applyFullScreen(_ fullScreen: Set<String>) {
+        var cameBack = false
         for (display, panel) in panels {
             let hide = fullScreen.contains("Main") || displayUUID[display].map { fullScreen.contains($0) } == true
             guard hide != hiddenForFullScreen.contains(display) else { continue }
+            setShown(panel, !hide)
             if hide {
                 hiddenForFullScreen.insert(display)
-                panel.orderOut(nil)
                 if let id = tooltip.windowID, views[display]?.slots.contains(where: { $0.info.id == id }) == true {
                     hoveredID = nil
                     hideTooltip(now: true)
@@ -755,11 +777,114 @@ final class Controller: NSObject, StripViewDelegate {
                 Log.info("panel", "display \(display): hidden, a full-screen app is showing")
             } else {
                 hiddenForFullScreen.remove(display)
-                Log.info("panel", "display \(display): back, \(orderIn(panel, display: display))")
+                cameBack = true
+                Log.info("panel", "display \(display): back")
             }
             updateCovers()
             writeState()
         }
+        // The end of full screen is when the panels have dropped off the other
+        // desktops before, so check once the Space change has settled.
+        if cameBack {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.keepOnEveryDesktop("the end of full screen")
+            }
+        }
+    }
+
+    /// Hides or shows a strip or cover without ordering it out: ordering
+    /// these panels back in can leave them on one desktop (applyFullScreen).
+    private func setShown(_ panel: StripPanel, _ shown: Bool) {
+        panel.alphaValue = shown ? 1 : 0
+        panel.ignoresMouseEvents = !shown
+    }
+
+    // MARK: - Every desktop
+
+    /// The strip and the cover belong on every desktop (`.canJoinAllSpaces`).
+    /// Once both ended up on one desktop only, so the bar was missing on the
+    /// others, while AppKit still had the behaviour set and the window
+    /// server's sticky flag still read on. Setting the behaviour again didn't
+    /// bring them back; new panels did. So when a shown panel is missing from
+    /// a window list, or a full-screen app has just ended, this asks which
+    /// desktops they are on (about 0.3 ms) and, if not all of them, rebuilds
+    /// the panels once a Space change has settled (a panel ordered in
+    /// mid-change may end up on one desktop again). Rebuilds are at least 3 s
+    /// apart, and one that didn't last a minute doubles that gap (up to
+    /// 5 min), so a cause that keeps coming back can't make the bar flicker.
+    private func keepOnEveryDesktop(_ reason: String) {
+        let state = SpaceState.now()
+        var stuck: [String] = []
+        for (display, strip) in panels where !hiddenForFullScreen.contains(display) {
+            guard let desktops = state.desktops["Main"] ?? displayUUID[display].flatMap({ state.desktops[$0] }),
+                  desktops.count > 1 else { continue }
+            for (what, panel) in [("strip", strip), ("cover", covers[display])] {
+                guard let panel, panel.isVisible else { continue }
+                let on = SpaceState.spaces(of: CGWindowID(panel.windowNumber))
+                if !on.isEmpty, !desktops.isSubset(of: on) {
+                    stuck.append("display \(display): the \(what) was on \(spaceList(on)) only, not all \(desktops.count) desktops")
+                }
+            }
+        }
+        guard !stuck.isEmpty else {
+            Log.debug("panel", "on every desktop (checked at \(reason))")
+            return
+        }
+        let now = uptimeNs()
+        let ready = max(spaceChangedAt &+ 1_000_000_000, lastDesktopRepair &+ desktopRepairGap)
+        if ready > now {
+            guard !desktopRepairPending else { return }
+            desktopRepairPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(ready - now) / 1e9) { [weak self] in
+                self?.desktopRepairPending = false
+                self?.keepOnEveryDesktop(reason)
+            }
+            return
+        }
+        let lastedAMinute = lastDesktopRepair == 0 || now &- lastDesktopRepair >= 60_000_000_000
+        desktopRepairGap = lastedAMinute ? 3_000_000_000 : min(desktopRepairGap * 2, 300_000_000_000)
+        lastDesktopRepair = now
+        desktopRepairs += 1
+        Log.info("panel", stuck.joined(separator: "; ") + " (seen at \(reason)); rebuilt the panels")
+        buildPanels()
+        refresh("every desktop")
+    }
+
+    private func spaceList(_ spaces: Set<UInt64>) -> String {
+        (spaces.count == 1 ? "Space " : "Spaces ") + spaces.sorted().map(String.init).joined(separator: ", ")
+    }
+
+    /// A shown strip or cover missing from the on-screen list may have
+    /// dropped off this desktop, so this checks the desktops themselves, at
+    /// most every 2 s. The list can also predate a panel just ordered in; then
+    /// the check finds it on every desktop and changes nothing.
+    private func checkShown(_ list: [CGWin]) {
+        let now = uptimeNs()
+        guard now &- lastDesktopCheck > 2_000_000_000 else { return }
+        let listed = Set(list.map(\.id))
+        let missing = panels.contains { display, strip in
+            !hiddenForFullScreen.contains(display) && [strip, covers[display]].contains { panel in
+                guard let panel, panel.isVisible, panel.alphaValue > 0 else { return false }
+                return !listed.contains(CGWindowID(panel.windowNumber))
+            }
+        }
+        guard missing else { return }
+        lastDesktopCheck = now
+        keepOnEveryDesktop("a window list without it")
+    }
+
+    /// For the tests only, and only with `defaults write dev.windowstrip
+    /// testHooks -bool true`: clears the strip's and the cover's "every
+    /// Space" flag, which leaves them on this desktop only, so T28 can check
+    /// that they come back on the others.
+    @objc private func testDropEveryDesktop() {
+        guard UserDefaults.standard.bool(forKey: "testHooks") else { return }
+        for (display, strip) in panels {
+            for panel in [strip, covers[display]].compactMap({ $0 }) where panel.isVisible {
+                dropOwnWindowSticky(CGWindowID(panel.windowNumber))
+            }
+        }
+        Log.info("test", "cleared the every-desktop flag of the strip and the cover")
     }
 
     // MARK: - Menus right of the notch
@@ -795,17 +920,19 @@ final class Controller: NSObject, StripViewDelegate {
             guard let area = coverArea[display] else { continue }
             let width = min(area.width, max(0, (menuEnd[display] ?? 0) + 6 - area.minX))
             if width < 1 || hiddenForFullScreen.contains(display) {
-                if cover.isVisible {
-                    cover.orderOut(nil)
+                if cover.alphaValue > 0 {
+                    setShown(cover, false)
                     Log.info("cover", "display \(display): off")
                 }
                 continue
             }
             let frame = NSRect(x: area.minX, y: area.minY, width: width, height: area.height)
             if cover.frame != frame { cover.setFrame(frame, display: true) }
-            if !cover.isVisible {
-                let how = orderIn(cover, display: display)
-                Log.info("cover", "display \(display): covering the menus right of the notch, x \(Int(area.minX))…\(Int(area.minX + width)), \(how)")
+            if cover.alphaValue == 0 || !cover.isVisible {
+                setShown(cover, true)
+                // Only if something took it off screen.
+                let how = cover.isVisible ? "" : ", " + orderIn(cover, display: display)
+                Log.info("cover", "display \(display): covering the menus right of the notch, x \(Int(area.minX))…\(Int(area.minX + width))\(how)")
             }
         }
     }
@@ -1208,7 +1335,7 @@ final class Controller: NSObject, StripViewDelegate {
         StateFile.write([
             "version": 2, "engine": "events", "seq": stateSeq, "pid": Int(ownPid),
             "writtenAtUptimeNs": uptimeNs(), "trusted": trusted, "windowServerRaise": Raiser.hasWindowServerCalls,
-            "panels": panelList, "tooltip": tip,
+            "panels": panelList, "tooltip": tip, "desktopRepairs": desktopRepairs,
             "neighbours": neighbours.map { ["windowId": Int($0.win.id), "owner": $0.win.owner, "pid": Int($0.win.pid),
                                             "layer": $0.win.layer, "frame": json($0.win.frame), "closed": $0.closed] as [String: Any] },
             "lastRaise": lastRaise, "recentRefreshMs": refreshTimes.values,

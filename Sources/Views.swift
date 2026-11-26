@@ -149,7 +149,7 @@ final class StripView: NSView {
 
     /// What the strip shows now, drawn into a bitmap; nil while it's hidden.
     private func image() -> CGImage? {
-        guard window?.isVisible == true, !bounds.isEmpty, let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        guard let window, window.isVisible, window.alphaValue > 0, !bounds.isEmpty, let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
         cacheDisplay(in: bounds, to: rep)
         return rep.cgImage
     }
@@ -163,9 +163,9 @@ final class StripView: NSView {
     /// Re-derives the hovered icon from where the pointer really is, so a
     /// re-layout under a resting pointer updates hover and tooltip at once.
     func followPointer() {
-        // A strip taken off screen for a full-screen app has no hover: its
-        // tooltip would show over that app.
-        guard let window, window.isVisible else { setHover(nil); return }
+        // A strip hidden for a full-screen app has no hover: its tooltip
+        // would show over that app.
+        guard let window, window.isVisible, window.alphaValue > 0 else { setHover(nil); return }
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         setHover(bounds.contains(point) ? slot(at: point) : nil)
     }
@@ -231,7 +231,10 @@ final class Tooltip {
     private let view = TooltipView()
     private(set) var windowID: CGWindowID?
 
-    var isVisible: Bool { panel.isVisible }
+    /// It stays on screen once shown and is only made transparent: showing
+    /// it never orders a window in, which during a Space change could leave
+    /// it on one desktop (Controller.applyFullScreen).
+    var isVisible: Bool { panel.isVisible && panel.alphaValue > 0 }
     var text: String { view.text }
 
     init() {
@@ -257,15 +260,19 @@ final class Tooltip {
         panel.setFrame(NSRect(x: x, y: anchor.minY - size.height - 5, width: size.width, height: size.height), display: true)
         view.needsDisplay = true
         if !panel.isVisible { panel.orderFrontRegardless() }
+        panel.alphaValue = 1
     }
 
+    /// The first call (when the panels are built) puts it on screen,
+    /// transparent.
     func hide() {
         windowID = nil
-        if panel.isVisible { panel.orderOut(nil) }
+        panel.alphaValue = 0
+        if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
     func snapshot() -> NSBitmapImageRep? {
-        guard panel.isVisible, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        guard isVisible, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
         view.cacheDisplay(in: view.bounds, to: rep)
         return rep
     }

@@ -152,6 +152,7 @@ struct StripState: Decodable {
     let lastRaise: RaiseState?
     let recentRefreshMs: [Double]?
     let stalls: [StallState]?
+    let desktopRepairs: Int?
 
     var written: UInt64 { writtenAtUptimeNs.value }
     var buttons: [StripButton] { panels.flatMap(\.buttons) }
@@ -1089,7 +1090,7 @@ final class Harness {
         if let s = reader.read() {
             let age = msFrom(s.written, to: nowNs()) / 1000
             parts.append("WindowStrip pid \(s.pid)\(s.engine.map { " (\($0) engine)" } ?? ""), state.json written \(String(format: "%.1f", age)) s ago")
-            if !notchScreens().isEmpty, !cgWindows().contains(where: { $0.pid == s.pid && $0.layer > 0 }) {
+            if !notchScreens().isEmpty, !cgWindows().contains(where: { $0.pid == s.pid && $0.layer > 0 && $0.alpha > 0 }) {
                 parts.append("the strip is NOT on screen (a full-screen Space?), so most tests will fail")
             }
         } else {
@@ -1127,6 +1128,7 @@ extension Harness {
         TestCase("T25", "raise-z-order", mouse: true) { try $0.t25() },
         TestCase("T26", "late-raise", mouse: true) { try $0.t26() },
         TestCase("T27", "full-screen") { try $0.t27() },
+        TestCase("T28", "every-desktop") { try $0.t28() },
         TestCase("T23", "soak") { try $0.t23() },
         // Last: these read the whole run, then WindowStrip is restarted.
         TestCase("T17", "stalls") { try $0.t17() },

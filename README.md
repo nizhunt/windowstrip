@@ -83,17 +83,19 @@ This part is for anyone who wants to change it.
 4. A click raises the window through the window server's own calls where they exist, as yabai, Hammerspoon and AltTab do, with Accessibility as the fallback. Each app gets its own queue, so a hung app can't hold up clicks on the others.
 5. The panels sit at window level 26, ordered just under the notch apps' windows at the same level, and the icons stop short of whatever covers the notch.
 6. Browser tabs come from Apple events sent to the browser, and their icons from the browser's Favicons database, opened read-only.
+7. The panels belong on every desktop, and they stay on screen. On a full-screen app's desktop they turn transparent and let clicks through, and so does the cover right of the notch while it's off. A panel taken off screen there and put back as the full-screen app closed ended up on one desktop only. In case one still drops off a desktop, WindowStrip checks which desktops the panels are on whenever a shown one is missing from the window list and just after a full-screen app closes, and rebuilds them if one has.
 
 Private APIs can break with any macOS update. If the bar is missing after one, `launchctl print gui/$(id -u)/dev.windowstrip | grep -E 'state|runs|last'` shows whether it keeps exiting (a rising runs count), and Crash Reports in Console show why. If only the window server's raise calls are gone, the log's start line says `windowServerRaise=false` and clicks go through Accessibility.
 
 ## Tests
 
-`tests/run-tests.sh` runs 27 end-to-end tests against the running app, in about 35 seconds once its tools are built (the first run builds them). They move the pointer, click, open and close a test app's windows, switch desktops through Mission Control, take a window full screen and restart WindowStrip, so leave the Mac alone while they run.
+`tests/run-tests.sh` runs 28 end-to-end tests against the running app, in about 35 seconds once its tools are built (the first run builds them). They move the pointer, click, open and close a test app's windows, switch desktops through Mission Control, take a window full screen and restart WindowStrip, so leave the Mac alone while they run.
 
 1. Run them from a terminal that has the Accessibility permission, with the app installed through `./build.sh --install`. Without the permission the mouse tests and the desktop-switch test skip.
 2. Run them on a desktop with only a few windows. The test app's icons go at the end of the bar, and on a full bar they are left off and the tests fail.
-3. The desktop-switch test needs a second desktop and skips with one. It finds Mission Control's desktop buttons by their English names, or by position when that is unambiguous, and skips when it can't find them.
+3. The desktop-switch tests need a second desktop and skip with one. They find Mission Control's desktop buttons by their English names, or by position when that is unambiguous, and skip when they can't find them.
 4. Without a notch app the layering checks skip.
+5. The every-desktop test (T28) turns on WindowStrip's test hook with the `testHooks` setting, uses it to take the bar off the other desktops, and checks that the bar comes back there. It removes the setting afterwards, and the hook does nothing without it.
 
 `--only T04,T07` runs some of them, `--no-mouse` leaves out the ones that click and hover, and `--json tests/build/runs/run-1.json` saves the results. `tests/compare.py a.json b.json -- c.json d.json` compares the timings of two sets of runs, and `tests/measure.py watch 120` reads what WindowStrip costs the Mac (CPU, wakeups, disk writes, memory) from the kernel over two minutes.
 

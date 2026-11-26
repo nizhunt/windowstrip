@@ -1,7 +1,7 @@
-// More end-to-end tests (T19-T27): desktop switches, a resting pointer, a
+// More end-to-end tests (T19-T28): desktop switches, a resting pointer, a
 // hung app, overflow, a soak, the notch order after a restart, the window
-// order a click leaves behind, a late raise from a busy app, and a window
-// going full screen.
+// order a click leaves behind, a late raise from a busy app, a window going
+// full screen, and a strip that drops off the other desktops.
 
 import AppKit
 import ApplicationServices
@@ -10,10 +10,11 @@ struct DesktopInfo { let index: Int; let count: Int }
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSCopyManagedDisplaySpaces") func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> Unmanaged<CFArray>
+@_silgen_name("CGSCopySpacesForWindows") func CGSCopySpacesForWindows(_ cid: Int32, _ mask: Int32, _ windows: CFArray) -> Unmanaged<CFArray>?
 
-/// The current Space type on the notched display (or the first one):
-/// 0 a desktop, 4 a full-screen app; -1 if unknown.
-func currentSpaceType() -> Int {
+/// The notched display's entry in the window server's list of Spaces (or the
+/// first one, which is "Main" when displays share Spaces).
+func notchDisplaySpaces() -> [String: Any]? {
     let displays = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()).takeRetainedValue() as? [[String: Any]] ?? []
     var uuid: String?
     if let screen = notchScreens().first,
@@ -21,8 +22,39 @@ func currentSpaceType() -> Int {
        let u = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() {
         uuid = CFUUIDCreateString(nil, u) as String
     }
-    let display = displays.first { ($0["Display Identifier"] as? String) == uuid } ?? displays.first
-    return ((display?["Current Space"] as? [String: Any])?["type"] as? NSNumber)?.intValue ?? -1
+    return displays.first { ($0["Display Identifier"] as? String) == uuid } ?? displays.first
+}
+
+func managedSpaceID(_ space: [String: Any]?) -> UInt64? {
+    ((space?["id64"] as? NSNumber) ?? (space?["ManagedSpaceID"] as? NSNumber))?.uint64Value
+}
+
+/// The current Space type on the notched display (or the first one):
+/// 0 a desktop, 4 a full-screen app; -1 if unknown.
+func currentSpaceType() -> Int {
+    ((notchDisplaySpaces()?["Current Space"] as? [String: Any])?["type"] as? NSNumber)?.intValue ?? -1
+}
+
+/// The Space the notched display shows.
+func currentSpace() -> UInt64? { managedSpaceID(notchDisplaySpaces()?["Current Space"] as? [String: Any]) }
+
+/// The notched display's desktops (Space type 0).
+func notchDesktops() -> Set<UInt64> {
+    let spaces = notchDisplaySpaces()?["Spaces"] as? [[String: Any]] ?? []
+    return Set(spaces.filter { ($0["type"] as? NSNumber)?.intValue == 0 }.compactMap { managedSpaceID($0) })
+}
+
+/// The Spaces the window server puts a window on (any process's window).
+func spacesOf(_ window: UInt32) -> Set<UInt64> {
+    let list = CGSCopySpacesForWindows(CGSMainConnectionID(), 7, [NSNumber(value: window)] as CFArray)?
+        .takeRetainedValue() as? [NSNumber] ?? []
+    return Set(list.map(\.uint64Value))
+}
+
+/// Turns WindowStrip's test hooks on or off (off removes the setting).
+func setTestHooks(_ on: Bool) {
+    CFPreferencesSetAppValue("testHooks" as CFString, on ? kCFBooleanTrue : nil, "dev.windowstrip" as CFString)
+    _ = CFPreferencesAppSynchronize("dev.windowstrip" as CFString)
 }
 
 extension Harness {
@@ -448,12 +480,15 @@ extension Harness {
     // MARK: - T27 full screen
 
     /// T27: test window A goes full screen. While its Space shows, the strip
-    /// is off screen; once A leaves full screen, the strip is back.
+    /// is hidden (transparent); once A leaves full screen, the strip is back,
+    /// and on every desktop, not only this one (it once wasn't).
     func t27() throws -> Outcome {
         let app1 = try app("app1")
         let a = try ensure("A", in: app1, shown: true)
-        let pid = try state().pid
-        func stripOnScreen() -> Bool { cgWindows().contains { $0.pid == pid && $0.layer > 0 } }
+        let s = try state()
+        guard let f = s.panels.first?.frame else { return .inconclusive("state.json has no strip") }
+        let pid = s.pid, repairsBefore = s.desktopRepairs ?? 0
+        func stripOnScreen() -> Bool { shownStrip(pid: pid, at: f) != nil }
         guard currentSpaceType() == 0, stripOnScreen() else { return .inconclusive("not on a desktop with the strip showing") }
         let rf = try app1.send("focus A")
         _ = makeActive(app1, event: app1.at(rf))
@@ -481,8 +516,99 @@ extension Harness {
         if !hidden { problems.append("the strip stayed on screen over the full-screen window") }
         else if !stayedHidden { problems.append("the strip came back while A was still full screen") }
         if !shown { problems.append("the strip did not come back after A left full screen") }
+        // On every desktop: at once, or after WindowStrip's check 1.5 s after
+        // full screen ends rebuilds the panels (a new window number).
+        let desktops = notchDesktops()
+        if shown, desktops.count > 1 {
+            func stripSpaces() -> Set<UInt64> { reader.read()?.panels.first?.windowNumber.map { spacesOf(UInt32($0)) } ?? [] }
+            if !pollUntil(2500, everyMs: 20, { desktops.isSubset(of: stripSpaces()) }) {
+                problems.append("the strip came back on Spaces \(stripSpaces().sorted()) only, not every desktop \(desktops.sorted())")
+            }
+        }
+        let repaired = (reader.read()?.desktopRepairs ?? repairsBefore) - repairsBefore
         _ = a
         let detail = "hidden \(hidden ? msText(hideMs) : "never") after the full-screen Space showed, back \(shown ? msText(showMs) : "never") after it left"
+            + (repaired > 0 ? "; it came back on one desktop only and WindowStrip rebuilt it" : "")
+        return problems.isEmpty ? .pass(nil, detail) : .fail(problems.joined(separator: "; ") + " [\(detail)]")
+    }
+
+    // MARK: - T28 every desktop
+
+    /// WindowStrip's shown strip on this desktop: its window at the strip's
+    /// place, not transparent (any window number: a repair makes a new one).
+    func shownStrip(pid: Int32, at f: Box) -> CGWin? {
+        cgWindows().first { $0.pid == pid && $0.layer > 0 && $0.alpha > 0
+            && abs($0.bounds.minX - f.x) < 1 && abs($0.bounds.width - f.w) < 1 }
+    }
+
+    /// T28: the strip drops off the other desktops, as it once did after a
+    /// full-screen app (the bar was then missing there). WindowStrip's test hook clears its
+    /// "every Space" flag, which leaves it on this desktop only. After a
+    /// switch to another desktop a strip must show there within 2.5 s (a new
+    /// one: WindowStrip rebuilds its panels once the switch settles), be on
+    /// every desktop, and still show after the switch back. The test turns
+    /// the hook on and removes the setting after; if the strip is still on
+    /// one desktop at the end, it restarts WindowStrip.
+    func t28() throws -> Outcome {
+        let desktops = notchDesktops()
+        guard desktops.count >= 2 else { return .skip("only one desktop") }
+        let s = try state()
+        guard let first = s.panels.first, let n = first.windowNumber, n > 0 else { return .inconclusive("state.json has no strip window number") }
+        let strip = UInt32(n), f = first.frame, pid = s.pid, repairsBefore = s.desktopRepairs ?? 0
+        guard currentSpaceType() == 0, shownStrip(pid: pid, at: f)?.id == strip, let here = desktop(), here.count >= 2 else {
+            return .inconclusive("not on a desktop with the strip showing")
+        }
+        guard desktops.isSubset(of: spacesOf(strip)) else {
+            return .fail("the strip was on Spaces \(spacesOf(strip).sorted()) only before the test, not every desktop \(desktops.sorted())")
+        }
+        let home = here.index, other = home < here.count ? home + 1 : home - 1
+        setTestHooks(true)
+        defer {
+            setTestHooks(false)
+            let now = reader.read()?.panels.first?.windowNumber.map { spacesOf(UInt32($0)) } ?? []
+            if !desktops.isSubset(of: now) {
+                warn("T28 left the strip on Spaces \(now.sorted()) only; restarting WindowStrip")
+                _ = runTool("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/dev.windowstrip"])
+                sleepMs(2500)
+            }
+        }
+        DistributedNotificationCenter.default().postNotificationName(Notification.Name("dev.windowstrip.test.dropEveryDesktop"),
+                                                                     object: nil, userInfo: nil, deliverImmediately: true)
+        guard pollUntil(1000, everyMs: 2, { !desktops.isSubset(of: spacesOf(strip)) }) else {
+            return .skip("WindowStrip's test hook did nothing (an older build, or it didn't see the testHooks setting)")
+        }
+        var problems: [String] = []
+        var detail = ""
+        switch switchDesktop(other) {
+        case .unsupported(let why):
+            return .skip("can't switch desktops (\(why))")
+        case .failed:
+            return .fail("could not switch to desktop \(other)")
+        case .done(let at):
+            var arrived: CGWin?
+            _ = pollUntil(2500, everyMs: 5) {
+                guard let w = shownStrip(pid: pid, at: f), let now = currentSpace(), spacesOf(w.id).contains(now) else { return false }
+                arrived = w
+                return true
+            }
+            if let w = arrived {
+                detail = "a strip showed on desktop \(other) \(msText(msFrom(at, to: nowNs()))) after the switch"
+                if w.id == strip { problems.append("the strip on desktop \(other) is the old window, so nothing was rebuilt") }
+                if !desktops.isSubset(of: spacesOf(w.id)) {
+                    problems.append("the strip on desktop \(other) is on Spaces \(spacesOf(w.id).sorted()) only, not every desktop \(desktops.sorted())")
+                }
+            } else {
+                problems.append("no strip on desktop \(other) 2.5 s after the switch")
+            }
+            if goToDesktop(home) == nil {
+                problems.append("could not switch back to desktop \(home)")
+            } else if !pollUntil(1500, everyMs: 10, { shownStrip(pid: pid, at: f) != nil }) {
+                problems.append("no strip back on desktop \(home)")
+            }
+        }
+        let repaired = (reader.read()?.desktopRepairs ?? repairsBefore) - repairsBefore
+        detail += (detail.isEmpty ? "" : "; ") + "\(repaired) rebuild\(repaired == 1 ? "" : "s")"
+        if repaired != 1 { problems.append("WindowStrip rebuilt its panels \(repaired) times, not once") }
         return problems.isEmpty ? .pass(nil, detail) : .fail(problems.joined(separator: "; ") + " [\(detail)]")
     }
 }
