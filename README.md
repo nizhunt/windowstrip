@@ -2,6 +2,8 @@
 
 A bar in the strip left of the MacBook notch that shows the windows on the desktop you are looking at. One icon per window, grouped by app, with the front window highlighted. Hover an icon for the app and window title, and click it to bring that exact window to the front.
 
+![WindowStrip's bar with five windows, the front one highlighted](docs/screenshot.png)
+
 I used Stage Manager mostly to see which apps were open on each desktop, and it was clunky and buggy at that. WindowStrip puts that view in the menu bar instead.
 
 ## What it does
